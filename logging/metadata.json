@@ -1,0 +1,8 @@
+{
+  "model": "rule-based-local-deterministic",
+  "parameter_size": "0B",
+  "framework": "Python 3 standard library; deterministic A2A-style handoffs",
+  "runtime": "local",
+  "policy_version": "EC_POLICY_V2",
+  "cases_processed": 50
+}
