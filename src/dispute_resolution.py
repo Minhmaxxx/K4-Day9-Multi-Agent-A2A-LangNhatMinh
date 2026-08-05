@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import os
 import shutil
 from collections import defaultdict
 from dataclasses import dataclass
@@ -17,6 +18,8 @@ from datetime import datetime
 from decimal import Decimal, ROUND_HALF_UP
 from pathlib import Path
 from typing import Any, Callable, Iterable, Optional
+from urllib.error import HTTPError, URLError
+from urllib.request import Request, urlopen
 
 
 MODEL_NAME = "rule-based-local-deterministic"
@@ -40,7 +43,8 @@ MAXIMUMS = {
 
 
 def read_csv(path: Path) -> list[dict[str, str]]:
-    with path.open("r", encoding="utf-8", newline="") as source:
+    # utf-8-sig safely strips a UTF-8 BOM when a supplied CSV has one.
+    with path.open("r", encoding="utf-8-sig", newline="") as source:
         return list(csv.DictReader(source))
 
 
@@ -84,6 +88,7 @@ class DataStore:
     items_by_order: dict[str, list[dict[str, str]]]
     payments_by_order: dict[str, list[dict[str, str]]]
     products: dict[str, dict[str, str]]
+    category_translations: dict[str, str]
     orders_by_customer: dict[str, list[str]]
 
     @classmethod
@@ -93,6 +98,7 @@ class DataStore:
         item_rows = read_csv(data_dir / "olist_order_items_dataset.csv")
         payment_rows = read_csv(data_dir / "olist_order_payments_dataset.csv")
         product_rows = read_csv(data_dir / "olist_products_dataset.csv")
+        translation_rows = read_csv(data_dir / "product_category_name_translation.csv")
 
         customers = {row["customer_id"]: row for row in customer_rows}
         orders = {row["order_id"]: row for row in orders_rows}
@@ -113,6 +119,7 @@ class DataStore:
             items_by_order=items_by_order,
             payments_by_order=payments_by_order,
             products={row["product_id"]: row for row in product_rows},
+            category_translations={row["product_category_name"]: row["product_category_name_english"] for row in translation_rows},
             orders_by_customer=orders_by_customer,
         )
 
@@ -159,6 +166,9 @@ class CustomerAgent:
 class OrderProductAgent:
     name = "order_product_agent"
 
+    def __init__(self, category_language: str = "source") -> None:
+        self.category_language = category_language
+
     def investigate(self, order: dict[str, str], scope: dict[str, Any], data: DataStore) -> dict[str, Any]:
         items = data.items_by_order.get(order["order_id"], [])
         seller_ids = stable_unique(item["seller_id"] for item in items)
@@ -166,9 +176,11 @@ class OrderProductAgent:
         categories: list[str] = []
         if scope.get("include_product_context", False):
             product_ids = stable_unique(item["product_id"] for item in items)
-            categories = stable_unique(
-                data.products.get(product_id, {}).get("product_category_name", "") for product_id in product_ids
-            )
+            source_categories = [data.products.get(product_id, {}).get("product_category_name", "") for product_id in product_ids]
+            if self.category_language == "english":
+                categories = stable_unique(data.category_translations.get(category, category) for category in source_categories)
+            else:
+                categories = stable_unique(source_categories)
         return {
             "items": items,
             "item_ids": cap([f"{order['order_id']}:{item['order_item_id']}" for item in items], "item_ids"),
@@ -261,34 +273,60 @@ class PolicyAgent:
     name = "policy_agent"
 
     def decide(
-        self, order: dict[str, str], product: dict[str, Any], payment: dict[str, Any], delivery: dict[str, Any]
+        self,
+        order: dict[str, str],
+        product: dict[str, Any],
+        payment: dict[str, Any],
+        delivery: dict[str, Any],
+        primary_override: str | None = None,
     ) -> dict[str, Any]:
-        status = order["order_status"]
-        paid = payment["payment_total_decimal"] > 0
-        primary: str
+        if primary_override is None:
+            status = order["order_status"]
+            paid = payment["payment_total_decimal"] > 0
+            if status == "canceled" and paid:
+                primary = "canceled_order_paid"
+            elif status == "unavailable" and paid:
+                primary = "unavailable_order_paid"
+            elif delivery["delivery_late"] and delivery["late_handoff_seller_ids"]:
+                primary = "late_delivery_seller"
+            elif delivery["delivery_late"]:
+                primary = "late_delivery_logistics"
+            elif payment["payment_count"] >= 2 and payment["reconciled"] is True:
+                primary = "valid_split_payment"
+            else:
+                primary = "unsupported_late_claim"
+        else:
+            primary = primary_override
+        return self.resolve(primary, product, payment, delivery)
+
+    def resolve(
+        self, primary: str, product: dict[str, Any], payment: dict[str, Any], delivery: dict[str, Any]
+    ) -> dict[str, Any]:
         cause: str
         parties: list[dict[str, str]]
         refund = Decimal("0")
         actions: list[str]
-        if status == "canceled" and paid:
+        if primary == "canceled_order_paid":
             primary, cause = "canceled_order_paid", "ORDER_CANCELED_AFTER_PAYMENT"
             parties, refund, actions = ([{"party_type": "platform", "party_id": "OLIST_PLATFORM"}], payment["payment_total_decimal"], ["issue_full_refund"])
-        elif status == "unavailable" and paid:
+        elif primary == "unavailable_order_paid":
             primary, cause = "unavailable_order_paid", "ORDER_UNAVAILABLE_AFTER_PAYMENT"
             parties, refund, actions = ([{"party_type": "platform", "party_id": "OLIST_PLATFORM"}], payment["payment_total_decimal"], ["issue_full_refund"])
-        elif delivery["delivery_late"] and delivery["late_handoff_seller_ids"]:
+        elif primary == "late_delivery_seller":
             primary, cause = "late_delivery_seller", "SELLER_HANDOFF_AFTER_LIMIT"
             parties = [{"party_type": "seller", "party_id": seller} for seller in delivery["late_handoff_seller_ids"]]
             refund, actions = payment["freight_total_decimal"] or Decimal("0"), ["refund_freight"]
-        elif delivery["delivery_late"]:
+        elif primary == "late_delivery_logistics":
             primary, cause = "late_delivery_logistics", "CARRIER_DELIVERED_AFTER_ESTIMATE"
             parties, refund, actions = ([{"party_type": "logistics_provider", "party_id": "LOGISTICS_PROVIDER"}], payment["freight_total_decimal"] or Decimal("0"), ["refund_freight"])
-        elif payment["payment_count"] >= 2 and payment["reconciled"] is True:
+        elif primary == "valid_split_payment":
             primary, cause = "valid_split_payment", "MULTIPLE_PAYMENTS_RECONCILED"
             parties, actions = [], ["explain_valid_split_payment"]
-        else:
+        elif primary == "unsupported_late_claim":
             primary, cause = "unsupported_late_claim", "DELIVERY_WITHIN_ESTIMATE"
             parties, actions = [], ["reject_late_refund"]
+        else:
+            raise ValueError(f"Unknown primary issue: {primary}")
 
         secondary: list[str] = []
         if len(product["items"]) >= 2:
@@ -319,6 +357,131 @@ class PolicyAgent:
             "recommended_refund_brl": money(refund),
             "resolution_actions": cap(actions, "resolution_actions"),
         }
+
+
+def load_dotenv(path: Path = Path(".env")) -> None:
+    """Load simple KEY=VALUE settings without adding a python-dotenv dependency."""
+    if not path.exists():
+        return
+    for line in path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        os.environ.setdefault(key.strip(), value.strip().strip('"').strip("'"))
+
+
+def extract_json_object(content: str) -> dict[str, Any]:
+    """Extract the final JSON object when a chat model adds prose or a think block."""
+    decoder = json.JSONDecoder()
+    candidates: list[dict[str, Any]] = []
+    for index, character in enumerate(content):
+        if character != "{":
+            continue
+        try:
+            value, _ = decoder.raw_decode(content[index:])
+        except json.JSONDecodeError:
+            continue
+        if isinstance(value, dict):
+            candidates.append(value)
+    for candidate in reversed(candidates):
+        if "primary_issue" in candidate:
+            return candidate
+    raise ValueError("LLM did not return a JSON object containing primary_issue")
+
+
+class LLMPolicyAgent:
+    """A constrained policy agent served by a permitted local LM Studio model.
+
+    It receives normalised handoffs and selects the primary policy issue. The
+    public policy resolver then derives amounts, parties, and actions from that
+    selected issue and the verified source facts. This keeps numeric work out
+    of a small local model without encoding any case-specific answer.
+    """
+
+    name = "llm_policy_agent"
+    primary_to_cause = {
+        "canceled_order_paid": "ORDER_CANCELED_AFTER_PAYMENT",
+        "unavailable_order_paid": "ORDER_UNAVAILABLE_AFTER_PAYMENT",
+        "late_delivery_seller": "SELLER_HANDOFF_AFTER_LIMIT",
+        "late_delivery_logistics": "CARRIER_DELIVERED_AFTER_ESTIMATE",
+        "valid_split_payment": "MULTIPLE_PAYMENTS_RECONCILED",
+        "unsupported_late_claim": "DELIVERY_WITHIN_ESTIMATE",
+    }
+    def __init__(self) -> None:
+        load_dotenv()
+        self.base_url = os.getenv("LMSTUDIO_BASE_URL", "http://127.0.0.1:1234/v1").rstrip("/")
+        self.model = os.getenv("LMSTUDIO_MODEL", "")
+        self.token = os.getenv("LMSTUDIO_API_TOKEN", "")
+        if not self.model:
+            raise ValueError("LLM mode requires LMSTUDIO_MODEL in .env")
+        self.retry_count = 0
+
+    def _chat(self, facts: dict[str, Any], correction: str = "") -> dict[str, Any]:
+        prompt = """You are the Policy Agent for EC_POLICY_V2. Return JSON only; no markdown or explanation.
+Apply these rules in exact priority: (1) canceled and payment_total>0 -> canceled_order_paid;
+(2) unavailable and payment_total>0 -> unavailable_order_paid; (3) delivery_late and nonempty
+late_handoff_seller_ids -> late_delivery_seller; (4) delivery_late -> late_delivery_logistics;
+(5) payment_count>=2 and reconciled=true -> valid_split_payment; otherwise unsupported_late_claim.
+Return exactly {"primary_issue":"one_allowed_value"}. The allowed values are:
+canceled_order_paid, unavailable_order_paid, late_delivery_seller, late_delivery_logistics,
+valid_split_payment, unsupported_late_claim.
+Facts:\n""" + json.dumps(facts, ensure_ascii=False, separators=(",", ":")) + "\n/no_think"
+        if correction:
+            prompt += "\nThe previous answer was rejected: " + correction + ". Return a corrected JSON object only."
+        headers = {"Content-Type": "application/json"}
+        if self.token:
+            headers["Authorization"] = f"Bearer {self.token}"
+        body = json.dumps({
+            "model": self.model,
+            "temperature": 0,
+            "max_tokens": 80,
+            "messages": [
+                {"role": "system", "content": "You output only strict JSON for a deterministic policy contract."},
+                {"role": "user", "content": prompt},
+            ],
+        }).encode("utf-8")
+        request = Request(f"{self.base_url}/chat/completions", data=body, headers=headers, method="POST")
+        try:
+            with urlopen(request, timeout=180) as response:
+                payload = json.loads(response.read().decode("utf-8"))
+        except (HTTPError, URLError, TimeoutError) as error:
+            raise ValueError(f"LM Studio request failed: {error}") from error
+        return extract_json_object(payload["choices"][0]["message"]["content"])
+
+    def _validate(
+        self,
+        candidate: dict[str, Any],
+    ) -> str:
+        if set(candidate) != {"primary_issue"}:
+            raise ValueError("LLM policy JSON must contain only primary_issue")
+        primary = candidate["primary_issue"]
+        if primary not in self.primary_to_cause:
+            raise ValueError("LLM returned an unsupported primary_issue")
+        return primary
+
+    def decide(self, order: dict[str, str], product: dict[str, Any], payment: dict[str, Any], delivery: dict[str, Any]) -> dict[str, Any]:
+        facts = {
+            "order_status": order["order_status"],
+            "payment_total": payment["payment_total_brl"],
+            "payment_count": payment["payment_count"],
+            "reconciled": payment["reconciled"],
+            "freight_total": payment["freight_total_brl"],
+            "item_count": len(product["items"]),
+            "seller_ids": product["seller_ids"],
+            "category_count": len(product["category_names"]),
+            "delivery_late": delivery["delivery_late"],
+            "late_handoff_seller_ids": delivery["late_handoff_seller_ids"],
+        }
+        correction = ""
+        for _ in range(3):
+            try:
+                primary = self._validate(self._chat(facts, correction))
+                return PolicyAgent().decide(order, product, payment, delivery, primary_override=primary)
+            except (KeyError, TypeError, ValueError) as error:
+                self.retry_count += 1
+                correction = str(error)
+        raise ValueError("LLM policy could not satisfy the response contract after 3 local attempts")
 
 
 class VerifierAgent:
@@ -396,13 +559,15 @@ class VerifierAgent:
 class CoordinatorAgent:
     name = "coordinator_agent"
 
-    def __init__(self, data: DataStore, trace: Trace) -> None:
+    def __init__(
+        self, data: DataStore, trace: Trace, policy_agent: Any | None = None, category_language: str = "source"
+    ) -> None:
         self.data, self.trace = data, trace
         self.customer_agent = CustomerAgent()
-        self.order_product_agent = OrderProductAgent()
+        self.order_product_agent = OrderProductAgent(category_language)
         self.payment_agent = PaymentAgent()
         self.delivery_agent = DeliveryAgent()
-        self.policy_agent = PolicyAgent()
+        self.policy_agent = policy_agent or PolicyAgent()
         self.verifier_agent = VerifierAgent()
 
     def _handoff(self, case_id: str, agent: Any, method: Callable[..., dict[str, Any]], *args: Any) -> dict[str, Any]:
@@ -473,7 +638,16 @@ class CoordinatorAgent:
         return result
 
 
-def run_pipeline(input_dir: Path, data_dir: Path, output_dir: Path, trace_path: Path, metadata_path: Path) -> int:
+def run_pipeline(
+    input_dir: Path,
+    data_dir: Path,
+    output_dir: Path,
+    trace_path: Path,
+    metadata_path: Path,
+    policy_mode: str = "rules",
+    llm_parameter_size: str = "4B",
+    category_language: str = "source",
+) -> int:
     case_paths = sorted(input_dir.glob("EC_*.json"))
     if len(case_paths) != 50:
         raise ValueError(f"Expected exactly 50 input cases (EC_001.json..EC_050.json), found {len(case_paths)} in {input_dir}")
@@ -483,7 +657,13 @@ def run_pipeline(input_dir: Path, data_dir: Path, output_dir: Path, trace_path: 
 
     data = DataStore.load(data_dir)
     trace = Trace(trace_path)
-    coordinator = CoordinatorAgent(data, trace)
+    if policy_mode == "rules":
+        policy_agent: Any = PolicyAgent()
+    elif policy_mode == "llm":
+        policy_agent = LLMPolicyAgent()
+    else:
+        raise ValueError(f"Unsupported policy mode: {policy_mode}")
+    coordinator = CoordinatorAgent(data, trace, policy_agent, category_language)
     staging = output_dir.with_name(f"{output_dir.name}_staging")
     if staging.exists():
         shutil.rmtree(staging)
@@ -508,13 +688,20 @@ def run_pipeline(input_dir: Path, data_dir: Path, output_dir: Path, trace_path: 
     trace.flush()
     metadata_path.parent.mkdir(parents=True, exist_ok=True)
     metadata = {
-        "model": MODEL_NAME,
-        "parameter_size": MODEL_PARAMETER_SIZE,
-        "framework": "Python 3 standard library; deterministic A2A-style handoffs",
+        "model": policy_agent.model if policy_mode == "llm" else MODEL_NAME,
+        "parameter_size": llm_parameter_size if policy_mode == "llm" else MODEL_PARAMETER_SIZE,
+        "framework": (
+            "Python 3 standard library; Qwen policy agent through local LM Studio; deterministic data agents and verifier"
+            if policy_mode == "llm" else "Python 3 standard library; deterministic A2A-style handoffs"
+        ),
         "runtime": "local",
         "policy_version": POLICY_VERSION,
+        "policy_mode": policy_mode,
+        "category_language": category_language,
         "cases_processed": len(case_paths),
     }
+    if policy_mode == "llm":
+        metadata["llm_retry_count"] = policy_agent.retry_count
     with metadata_path.open("w", encoding="utf-8", newline="\n") as target:
         json.dump(metadata, target, ensure_ascii=False, indent=2)
         target.write("\n")
@@ -528,8 +715,20 @@ def main() -> None:
     parser.add_argument("--output-dir", type=Path, default=Path("output"))
     parser.add_argument("--trace", type=Path, default=Path("logging/trace.jsonl"))
     parser.add_argument("--metadata", type=Path, default=Path("logging/metadata.json"))
+    parser.add_argument("--policy-mode", choices=("rules", "llm"), default="rules")
+    parser.add_argument("--llm-parameter-size", default="4B")
+    parser.add_argument("--category-language", choices=("source", "english"), default="source")
     arguments = parser.parse_args()
-    count = run_pipeline(arguments.input_dir, arguments.data_dir, arguments.output_dir, arguments.trace, arguments.metadata)
+    count = run_pipeline(
+        arguments.input_dir,
+        arguments.data_dir,
+        arguments.output_dir,
+        arguments.trace,
+        arguments.metadata,
+        arguments.policy_mode,
+        arguments.llm_parameter_size,
+        arguments.category_language,
+    )
     print(f"Validated and wrote {count} case outputs to {arguments.output_dir}")
 
 

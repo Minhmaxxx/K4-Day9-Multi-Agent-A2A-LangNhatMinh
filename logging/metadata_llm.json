@@ -1,0 +1,17 @@
+{
+  "model": "qwen/qwen3-4b",
+  "parameter_size": "4B",
+  "framework": "Python 3 standard library; Qwen policy agent through local LM Studio; deterministic data agents and verifier",
+  "runtime": "local",
+  "policy_version": "EC_POLICY_V2",
+  "policy_mode": "llm",
+  "cases_processed": 50,
+  "llm_fallback_count": 43,
+  "llm_fallback_reasons": [
+    "LLM policy disagrees with EC_POLICY_V2 guard",
+    "LLM policy disagrees with EC_POLICY_V2 guard",
+    "LLM policy primary issue/cause mismatch",
+    "LLM policy disagrees with EC_POLICY_V2 guard",
+    "LLM policy primary issue/cause mismatch"
+  ]
+}
