@@ -52,3 +52,13 @@ output/EC_*.json, logging/trace.jsonl, logging/metadata.json
 - Decimal được dùng cho tổng BRL và sai số `0.10`, sau đó làm tròn hai chữ số.
 - Thứ tự mảng lấy từ thứ tự row nguồn; các danh sách unique giữ lần xuất hiện đầu tiên.
 - Một lượt chạy đòi hỏi đúng `EC_001.json` … `EC_050.json`; thiếu hoặc dư case là lỗi chặn để tránh submission không hoàn chỉnh.
+
+## Optional local-LLM policy deliberation
+
+Khi chạy `--policy-mode llm`, một instance local Qwen được dùng ba lần cho mỗi case, với ba role và handoff riêng:
+
+```text
+verified evidence packet → Policy Proposer → Policy Critic → Policy Finalizer → public-policy resolver
+```
+
+Evidence packet là dữ liệu chỉ đọc đã được Customer, Order/Product, Payment và Delivery agents chuẩn hóa. Critic và Finalizer còn được cấp `Policy Eligibility Tool`, một tool chỉ đọc trả về các primary issue thỏa điều kiện policy công khai từ evidence packet. Proposer chọn primary issue; Critic tìm mâu thuẫn với facts/tool response; Finalizer chọn lại primary issue. Source verifier chỉ kiểm tra ID có thật, schema và các phép tính; nó không thay output bằng đáp án theo case. Handoff của ba role này được ghi vào trace.

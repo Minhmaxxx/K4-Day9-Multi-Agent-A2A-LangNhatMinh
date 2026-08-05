@@ -21,6 +21,8 @@ from typing import Any, Callable, Iterable, Optional
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
+from src.llm_policy_agents import PolicyDeliberationAgent
+
 
 MODEL_NAME = "rule-based-local-deterministic"
 MODEL_PARAMETER_SIZE = "0B"
@@ -371,7 +373,7 @@ def load_dotenv(path: Path = Path(".env")) -> None:
         os.environ.setdefault(key.strip(), value.strip().strip('"').strip("'"))
 
 
-def extract_json_object(content: str) -> dict[str, Any]:
+def extract_json_object(content: str, required_key: str = "primary_issue") -> dict[str, Any]:
     """Extract the final JSON object when a chat model adds prose or a think block."""
     decoder = json.JSONDecoder()
     candidates: list[dict[str, Any]] = []
@@ -385,9 +387,9 @@ def extract_json_object(content: str) -> dict[str, Any]:
         if isinstance(value, dict):
             candidates.append(value)
     for candidate in reversed(candidates):
-        if "primary_issue" in candidate:
+        if required_key in candidate:
             return candidate
-    raise ValueError("LLM did not return a JSON object containing primary_issue")
+    raise ValueError(f"LLM did not return a JSON object containing {required_key}")
 
 
 class LLMPolicyAgent:
@@ -588,7 +590,12 @@ class CoordinatorAgent:
         product = self._handoff(case_id, self.order_product_agent, self.order_product_agent.investigate, order, scope, self.data)
         payment = self._handoff(case_id, self.payment_agent, self.payment_agent.investigate, order_id, product["items"], self.data)
         delivery = self._handoff(case_id, self.delivery_agent, self.delivery_agent.investigate, order, product["items"])
-        policy = self._handoff(case_id, self.policy_agent, self.policy_agent.decide, order, product, payment, delivery)
+        if isinstance(self.policy_agent, PolicyDeliberationAgent):
+            policy = self.policy_agent.decide_with_trace(
+                case_id, self.trace, PolicyAgent(), order, product, payment, delivery
+            )
+        else:
+            policy = self._handoff(case_id, self.policy_agent, self.policy_agent.decide, order, product, payment, delivery)
         if customer["related_order_ids"]:
             policy["secondary_issues"].insert(3, "repeat_customer")
 
@@ -660,7 +667,15 @@ def run_pipeline(
     if policy_mode == "rules":
         policy_agent: Any = PolicyAgent()
     elif policy_mode == "llm":
-        policy_agent = LLMPolicyAgent()
+        load_dotenv()
+        llm_model = os.getenv("LMSTUDIO_MODEL", "")
+        if not llm_model:
+            raise ValueError("LLM mode requires LMSTUDIO_MODEL in .env")
+        policy_agent = PolicyDeliberationAgent(
+            os.getenv("LMSTUDIO_BASE_URL", "http://127.0.0.1:1234/v1"),
+            llm_model,
+            os.getenv("LMSTUDIO_API_TOKEN", ""),
+        )
     else:
         raise ValueError(f"Unsupported policy mode: {policy_mode}")
     coordinator = CoordinatorAgent(data, trace, policy_agent, category_language)

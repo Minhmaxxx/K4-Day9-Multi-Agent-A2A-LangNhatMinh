@@ -37,10 +37,10 @@ LM Studio uses `http://127.0.0.1:1234/v1` by default. No token is needed unless 
 
 ### LLM candidate run (run this yourself)
 
-Keep the submitted baseline untouched. The following command writes a separate candidate set; Qwen3 4B selects the primary issue from normalised source facts, while the other agents retrieve data and calculate evidence-backed totals. The public policy resolver derives refund/action fields from that selected issue, and source-ID validation plus at most two local retries protect the contract. It does not contain a case-ID answer key.
+Keep the submitted baseline untouched. The following command writes a separate candidate set. One local Qwen3 4B instance is called in three roles: Policy Proposer, Policy Critic and Policy Finalizer. Each sees a read-only evidence packet made from the supplied CSV data; Critic and Finalizer additionally receive a read-only Policy Eligibility Tool response derived from the public policy conditions. The public policy resolver derives refund/action fields from the final model choice, while source-ID validation plus bounded local retries protect the contract. There is no case-ID answer key and neither `input/` nor `data/` is modified.
 
 ```powershell
-python run.py --policy-mode llm --llm-parameter-size 4B --category-language english --output-dir output_llm_candidate --trace logging/trace_llm_candidate.jsonl --metadata logging/metadata_llm_candidate.json
+python run.py --policy-mode llm --llm-parameter-size 4B --category-language english --output-dir output_llm_agents_candidate --trace logging/trace_llm_agents_candidate.jsonl --metadata logging/metadata_llm_agents_candidate.json
 ```
 
 `--category-language english` derives category labels from `product_category_name_translation.csv`; use `source` if the expected schema is confirmed to require the original Portuguese labels. Verify and archive a candidate only after you decide it is better than the submitted baseline.
